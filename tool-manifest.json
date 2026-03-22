@@ -21,6 +21,7 @@
     "delete_blob",
     "delete_comment",
     "delete_doc",
+    "delete_folder",
     "delete_workspace",
     "duplicate_doc",
     "export_doc_markdown",

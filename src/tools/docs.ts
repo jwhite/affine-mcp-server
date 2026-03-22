@@ -5388,4 +5388,63 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       newParentId: z.string().optional().describe("ID of the new parent folder. Omit to move to the top level."),
     },
   }, moveFolderHandler as any);
+
+  // ─── delete_folder ───────────────────────────────────────────────────────────
+
+  const deleteFolderHandler = async (parsed: { workspaceId?: string; folderId: string; recursive?: boolean }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const { foldersDocId, ydoc, prevSV } = await loadFoldersDoc(workspaceId, socket);
+      const nodes = readFolderNodes(ydoc);
+
+      const folder = nodes.find(n => n.id === parsed.folderId && n.type === "folder");
+      if (!folder) throw new Error(`Folder not found: ${parsed.folderId}. Use list_folders to find valid folder IDs.`);
+
+      // Collect this folder and all descendants (folders + doc links inside them)
+      const toDelete = new Set<string>();
+      const collect = (id: string) => {
+        toDelete.add(id);
+        for (const n of nodes) {
+          if (n.parentId === id) collect(n.id);
+        }
+      };
+
+      if (parsed.recursive) {
+        collect(parsed.folderId);
+      } else {
+        const hasChildren = nodes.some(n => n.parentId === parsed.folderId);
+        if (hasChildren) throw new Error(`Folder has children. Use recursive:true to delete a folder and all its contents.`);
+        toDelete.add(parsed.folderId);
+      }
+
+      for (const id of toDelete) {
+        const row = ydoc.getMap(id);
+        row.set("$$DELETED", true);
+        row.delete("id");
+        row.delete("parentId");
+        row.delete("type");
+        row.delete("data");
+        row.delete("index");
+      }
+
+      const delta = Y.encodeStateAsUpdate(ydoc, prevSV);
+      await pushDocUpdate(socket, workspaceId, foldersDocId, Buffer.from(delta).toString("base64"));
+      return text({ deleted: true, folderId: parsed.folderId, deletedCount: toDelete.size });
+    } finally { socket.disconnect(); }
+  };
+
+  server.registerTool("delete_folder", {
+    title: "Delete Folder",
+    description: "Deletes a folder from the AFFiNE organise sidebar. Use recursive:true to also delete all subfolders and doc links inside it. Does not delete the underlying docs — only removes them from the folder tree.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      folderId: z.string().min(1).describe("ID of the folder to delete. Use list_folders to find folder IDs."),
+      recursive: z.boolean().optional().describe("If true, deletes the folder and all its contents. If false (default), fails if the folder has children."),
+    },
+  }, deleteFolderHandler as any);
 }

@@ -176,5 +176,35 @@ try {
   console.log('   Correct error thrown for invalid folderId');
 }
 
+// ── 10. delete_folder ────────────────────────────────────────────────────────
+console.log('\n10. delete_folder');
+
+// Non-recursive delete should fail on folder with children (newFolderId still has a doc link)
+try {
+  await callTool(client, 'delete_folder', { workspaceId: WORKSPACE_ID, folderId: newFolderId });
+  assert.fail('should have thrown for non-empty folder');
+} catch (e) {
+  assert.ok(e.message.includes('children') || e.message.includes('recursive'), `expected non-empty error, got: ${e.message}`);
+  console.log('   Correct error thrown for non-empty folder without recursive:true');
+}
+
+// Recursive delete of main test folder (contains doc link + subfolder that was moved to root)
+const deleted = await callTool(client, 'delete_folder', { workspaceId: WORKSPACE_ID, folderId: newFolderId, recursive: true });
+assert.ok(deleted.deleted, 'deleted should be true');
+assert.ok(deleted.deletedCount >= 2, 'should have deleted folder + doc link');
+console.log(`   Deleted folder and ${deleted.deletedCount} nodes`);
+
+// Clean up remaining test folders created during this run
+for (const id of [subCreated.folderId, targetId]) {
+  try {
+    await callTool(client, 'delete_folder', { workspaceId: WORKSPACE_ID, folderId: id, recursive: true });
+  } catch (_) { /* already deleted or moved */ }
+}
+
+// Verify deleted folder no longer appears
+const afterDelete = await callTool(client, 'list_folders', { workspaceId: WORKSPACE_ID });
+assert.ok(!afterDelete.flat.find(f => f.id === newFolderId), 'deleted folder should not appear in list');
+console.log('   Confirmed: deleted folder no longer in list_folders');
+
 await client.close();
 console.log('\n=== All folder tool tests passed ===');

@@ -322,6 +322,94 @@ function testCycleDetection() {
   console.log('✓ cycle detection correctly identifies invalid moves');
 }
 
+function softDeleteNode(ydoc, id) {
+  const row = ydoc.getMap(id);
+  row.set('$$DELETED', true);
+  row.delete('id');
+  row.delete('parentId');
+  row.delete('type');
+  row.delete('data');
+  row.delete('index');
+}
+
+function collectDescendants(nodes, id) {
+  const result = new Set([id]);
+  const collect = (parentId) => {
+    for (const n of nodes) {
+      if (n.parentId === parentId) {
+        result.add(n.id);
+        collect(n.id);
+      }
+    }
+  };
+  collect(id);
+  return result;
+}
+
+function testDeleteFolderSimple() {
+  const ydoc = new Y.Doc();
+  const id = generateId();
+  writeFolderNode(ydoc, { id, parentId: null, type: 'folder', data: 'To Delete' });
+
+  const prevSV = Y.encodeStateVector(ydoc);
+  softDeleteNode(ydoc, id);
+  const delta = Y.encodeStateAsUpdate(ydoc, prevSV);
+  assert.ok(delta.length > 0);
+
+  const nodes = readFolderNodes(ydoc);
+  assert.equal(nodes.length, 0, 'deleted folder should not appear');
+  console.log('✓ delete folder soft-deletes correctly');
+}
+
+function testDeleteRecursiveRemovesDescendants() {
+  const ydoc = new Y.Doc();
+  const rootId = generateId();
+  const childId = generateId();
+  const grandchildId = generateId();
+  const docLinkId = generateId();
+
+  writeFolderNode(ydoc, { id: rootId,       parentId: null,    type: 'folder', data: 'Root' });
+  writeFolderNode(ydoc, { id: childId,       parentId: rootId,  type: 'folder', data: 'Child' });
+  writeFolderNode(ydoc, { id: grandchildId,  parentId: childId, type: 'folder', data: 'Grandchild' });
+  writeFolderNode(ydoc, { id: docLinkId,     parentId: childId, type: 'doc',    data: generateId() });
+
+  const nodes = readFolderNodes(ydoc);
+  const toDelete = collectDescendants(nodes, rootId);
+  assert.equal(toDelete.size, 4, 'should collect all 4 nodes');
+
+  for (const id of toDelete) softDeleteNode(ydoc, id);
+
+  const remaining = readFolderNodes(ydoc);
+  assert.equal(remaining.length, 0, 'all nodes should be deleted');
+  console.log('✓ recursive delete removes all descendants');
+}
+
+function testDeleteNonRecursiveFailsWithChildren() {
+  const nodes = [
+    { id: 'parent', parentId: null,     type: 'folder', data: 'Parent', index: 'a0' },
+    { id: 'child',  parentId: 'parent', type: 'folder', data: 'Child',  index: 'a1' },
+  ];
+  const hasChildren = nodes.some(n => n.parentId === 'parent');
+  assert.ok(hasChildren, 'should detect children before non-recursive delete');
+  console.log('✓ non-recursive delete correctly detects children');
+}
+
+function testDeleteDoesNotAffectSiblings() {
+  const ydoc = new Y.Doc();
+  const keepId = generateId();
+  const deleteId = generateId();
+
+  writeFolderNode(ydoc, { id: keepId,   parentId: null, type: 'folder', data: 'Keep' });
+  writeFolderNode(ydoc, { id: deleteId, parentId: null, type: 'folder', data: 'Delete' });
+
+  softDeleteNode(ydoc, deleteId);
+
+  const nodes = readFolderNodes(ydoc);
+  assert.equal(nodes.length, 1);
+  assert.equal(nodes[0].id, keepId);
+  console.log('✓ delete does not affect sibling folders');
+}
+
 // ── run all ──────────────────────────────────────────────────────────────────
 testFolderNodeRoundTrip();
 testDocLinkNodeRoundTrip();
@@ -336,5 +424,9 @@ testIncrementalUpdatePreservesExistingNodes();
 testMoveFolderToNewParent();
 testMoveFolderToRoot();
 testCycleDetection();
+testDeleteFolderSimple();
+testDeleteRecursiveRemovesDescendants();
+testDeleteNonRecursiveFailsWithChildren();
+testDeleteDoesNotAffectSiblings();
 
 console.log('\nFolder Yjs unit tests passed.');
