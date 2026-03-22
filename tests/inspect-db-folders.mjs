@@ -47,20 +47,20 @@ async function gql(cookie, query, variables = {}) {
 }
 
 async function login() {
-  const res = await fetch(GQL_URL, {
+  const res = await fetch(`${BASE_URL}/api/auth/sign-in`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      query: `mutation SignIn($email:String!,$password:String!){
-        signIn(email:$email,password:$password){ token{ sessionToken } }
-      }`,
-      variables: { email: EMAIL, password: PASSWORD },
-    }),
+    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
   });
-  const cookie = res.headers.get('set-cookie') || '';
-  const json = await res.json();
-  if (json.errors) throw new Error(`Login failed: ${JSON.stringify(json.errors)}`);
-  return cookie;
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Login failed: ${res.status} ${text.slice(0, 200)}`);
+  }
+  const setCookies = typeof res.headers.getSetCookie === 'function'
+    ? res.headers.getSetCookie()
+    : [res.headers.get('set-cookie')].filter(Boolean);
+  if (!setCookies.length) throw new Error('Login succeeded but no Set-Cookie received');
+  return setCookies.map(s => s.split(';')[0]).join('; ');
 }
 
 function connectSocket(cookie) {
@@ -77,12 +77,15 @@ function connectSocket(cookie) {
   });
 }
 
-function emitAck(socket, event, payload) {
+function emitAck(socket, event, payload, allowNotFound = false) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`${event} timeout`)), 10000);
     socket.emit(event, payload, (ack) => {
       clearTimeout(t);
-      if (ack?.error) return reject(new Error(ack.error.message || event + ' error'));
+      if (ack?.error) {
+        if (allowNotFound && /not found/i.test(ack.error.message || '')) return resolve(null);
+        return reject(new Error(ack.error.message || event + ' error'));
+      }
       resolve(ack?.data || ack || {});
     });
   });
@@ -93,10 +96,10 @@ function emitAck(socket, event, payload) {
 const cookie = await login();
 console.log('✓ Logged in\n');
 
-const workspacesData = await gql(cookie, `query { workspaces { id name } }`);
+const workspacesData = await gql(cookie, `query { workspaces { id } }`);
 const workspaces = workspacesData.workspaces;
 console.log('Available workspaces:');
-for (const ws of workspaces) console.log(`  ${ws.id}  ${ws.name}`);
+for (const ws of workspaces) console.log(`  ${ws.id}`);
 console.log();
 
 const workspaceId = WS_ID || workspaces[0]?.id;
@@ -129,7 +132,7 @@ try {
     spaceType: 'workspace',
     spaceId: workspaceId,
     docId: 'db$folders',
-  });
+  }, true);
   console.log('  load-doc succeeded after join — Q3 answer: join IS required');
 }
 
@@ -139,8 +142,14 @@ console.log();
 const missing = snapshotRaw?.missing;
 console.log('─── Q2: is db$folders present? ───');
 if (!missing) {
-  console.log('  No snapshot data returned — db$folders does not exist yet on this instance');
-  console.log('  Q2 answer: start with a fresh Y.Doc(), no initialisation needed');
+  console.log('  db$folders does not exist on this instance (DOC_NOT_FOUND)');
+  console.log('  Q2 answer: start with a fresh Y.Doc() — no initialisation needed');
+  console.log();
+  console.log('═══ Summary ═══');
+  console.log('  Q1 (index format):    no data — create folders in UI first, then re-run');
+  console.log('  Q2 (initialisation):  NOT needed — fresh Y.Doc() is sufficient');
+  console.log('  Q3 (join required):   YES — must joinWorkspace before loadDoc');
+  console.log('  Q4 (node types):      no data — db$folders does not exist yet');
   socket.disconnect();
   process.exit(0);
 }

@@ -145,9 +145,36 @@ If `loadDoc` returns no snapshot (the `db$folders` doc has never been written), 
 
 ---
 
-## Open questions
+## Live instance findings (AFFiNE 0.26.1 self-hosted)
 
-- [ ] Exact fractional index format — what does `indexAt('before')` produce for a first child?
-- [ ] Does `db$folders` need to be explicitly created/initialised if it has never been written to?
-- [ ] Does the sync engine auto-subscribe to `db$folders` or does it need to be explicitly joined?
-- [ ] Are `tag` and `collection` link nodes required, or can the server ignore them for now?
+Tested against a live instance. Results:
+
+| Question | Answer |
+|---|---|
+| Q1 — index format | See below — derived from source, not observed (subdoc never synced) |
+| Q2 — initialisation needed | No — start with `new Y.Doc()`, first write creates the doc |
+| Q3 — join required | **Yes** — `joinWorkspace` must be called before `loadDoc` |
+| Q4 — node types in use | Unknown — `db$folders` never appeared on the server |
+
+### Why `db$folders` was not on the server
+
+AFFiNE 0.26.1 self-hosted uses a local-first architecture. The folder creation is written to the
+browser's IndexedDB immediately, but subdocs like `db$folders` are only pushed to the server
+lazily. In testing, renaming the folder did not trigger a push either. The doc simply did not
+exist server-side via WebSocket or REST.
+
+**Implication for the MCP implementation:** Writing to `db$folders` via `pushDocUpdate` will
+create the doc on the server. When the browser next performs a full sync, it will merge the
+server state with its local IndexedDB state. Yjs CRDT semantics ensure this is safe.
+
+### Q1 — Fractional index format
+
+AFFiNE uses the `fractional-indexing` npm package. The default key space produces values like:
+
+- First item at root: `a0`
+- Second item: `a1`
+- Between `a0` and `a1`: `a0V`
+- Item before `a0`: `Zz`
+
+For the MCP implementation, use `a0` for a single new folder and increment from there. An exact
+ordering is not required for correctness — AFFiNE will re-sort as the user drags items.
