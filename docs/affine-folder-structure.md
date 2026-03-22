@@ -197,6 +197,20 @@ The folder tools will follow the same pattern already used by `create_doc` and `
 
 ---
 
+## UI refresh behaviour
+
+Changes written by the MCP server (create, rename, move, delete) are pushed to the server
+immediately via `pushDocUpdate`. However, the AFFiNE browser client caches the folders doc in
+IndexedDB and does not always apply incoming server updates to the live view in real time.
+
+**A page refresh is required to see MCP-driven folder changes in the AFFiNE UI.**
+
+This is expected behaviour with AFFiNE's local-first architecture — the same applies to any
+external write to a Yjs subdocument. The data is correctly persisted on the server; the browser
+just needs to reload to reconcile its local cache with the server state.
+
+---
+
 ## Live instance findings (AFFiNE 0.26.1 self-hosted)
 
 Tested against `affine.fairleadsoftware.com` (workspace `cebf9206-76b3-4c77-a43f-2e72cb5ad426`).
