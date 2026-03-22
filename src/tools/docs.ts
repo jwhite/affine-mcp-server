@@ -5120,4 +5120,272 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     },
     addDatabaseColumnHandler as any
   );
+
+  // ─── folder helpers ──────────────────────────────────────────────────────────
+
+  type FolderNode = {
+    id: string;
+    parentId: string | null;
+    type: string;
+    data: string;
+    index: string;
+  };
+
+  function generateFolderIndex(): string {
+    // Produces a value in the same character-class range as AFFiNE's fractional indices.
+    // Ordering is non-critical — AFFiNE re-sorts when the user drags items.
+    return "a0" + generateId();
+  }
+
+  function readFolderNodes(ydoc: Y.Doc): FolderNode[] {
+    const nodes: FolderNode[] = [];
+    for (const key of (ydoc.share as Map<string, any>).keys()) {
+      const m = ydoc.getMap(key);
+      const deleted = m.get("$$DELETED");
+      if (deleted === true) continue;
+      const id = m.get("id");
+      const type = m.get("type");
+      if (!id || !type) continue;
+      nodes.push({
+        id: String(id),
+        parentId: (m.get("parentId") as string | null) ?? null,
+        type: String(type),
+        data: String(m.get("data") ?? ""),
+        index: String(m.get("index") ?? ""),
+      });
+    }
+    return nodes;
+  }
+
+  async function loadFoldersDoc(workspaceId: string, socket: Awaited<ReturnType<typeof connectWorkspaceSocket>>): Promise<{
+    foldersDocId: string;
+    ydoc: Y.Doc;
+    prevSV: Uint8Array;
+  }> {
+    const foldersDocId = `db$${workspaceId}$folders`;
+    const ydoc = new Y.Doc();
+    const snapshot = await loadDoc(socket, workspaceId, foldersDocId);
+    if (snapshot.missing) {
+      Y.applyUpdate(ydoc, Buffer.from(snapshot.missing, "base64"));
+    }
+    const prevSV = Y.encodeStateVector(ydoc);
+    return { foldersDocId, ydoc, prevSV };
+  }
+
+  // ─── list_folders ────────────────────────────────────────────────────────────
+
+  const listFoldersHandler = async (parsed: { workspaceId?: string; includeDocLinks?: boolean }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const { ydoc } = await loadFoldersDoc(workspaceId, socket);
+      let nodes = readFolderNodes(ydoc);
+      if (!parsed.includeDocLinks) nodes = nodes.filter(n => n.type === "folder");
+      nodes.sort((a, b) => a.index.localeCompare(b.index));
+
+      const childrenOf = new Map<string | null, FolderNode[]>();
+      for (const node of nodes) {
+        const key = node.parentId ?? null;
+        if (!childrenOf.has(key)) childrenOf.set(key, []);
+        childrenOf.get(key)!.push(node);
+      }
+
+      const buildTree = (parentId: string | null, depth: number): any[] =>
+        (childrenOf.get(parentId) ?? []).map(n => ({
+          id: n.id,
+          name: n.data,
+          type: n.type,
+          ...(parsed.includeDocLinks && n.type === "doc" ? { docId: n.data } : {}),
+          children: n.type === "folder" && depth < 10 ? buildTree(n.id, depth + 1) : [],
+        }));
+
+      return text({ workspaceId, folderCount: nodes.filter(n => n.type === "folder").length, tree: buildTree(null, 0), flat: nodes.map(n => ({ id: n.id, name: n.data, type: n.type, parentId: n.parentId })) });
+    } finally { socket.disconnect(); }
+  };
+
+  server.registerTool("list_folders", {
+    title: "List Folders",
+    description: "Returns the organise-sidebar folder tree for a workspace. Each folder has an id, name, and nested children. Use includeDocLinks:true to also see doc/tag/collection link nodes.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      includeDocLinks: z.boolean().optional().describe("Include doc/tag/collection link nodes in the result (default: false)."),
+    },
+  }, listFoldersHandler as any);
+
+  // ─── create_folder ───────────────────────────────────────────────────────────
+
+  const createFolderHandler = async (parsed: { workspaceId?: string; name: string; parentId?: string }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const { foldersDocId, ydoc, prevSV } = await loadFoldersDoc(workspaceId, socket);
+
+      if (parsed.parentId) {
+        const nodes = readFolderNodes(ydoc);
+        const parent = nodes.find(n => n.id === parsed.parentId && n.type === "folder");
+        if (!parent) throw new Error(`Parent folder not found: ${parsed.parentId}. Use list_folders to find valid folder IDs.`);
+      }
+
+      const rowId = generateId();
+      const row = ydoc.getMap(rowId);
+      row.set("id", rowId);
+      row.set("parentId", parsed.parentId ?? null);
+      row.set("type", "folder");
+      row.set("data", parsed.name);
+      row.set("index", generateFolderIndex());
+
+      const delta = Y.encodeStateAsUpdate(ydoc, prevSV);
+      await pushDocUpdate(socket, workspaceId, foldersDocId, Buffer.from(delta).toString("base64"));
+      return text({ created: true, folderId: rowId, name: parsed.name, parentId: parsed.parentId ?? null });
+    } finally { socket.disconnect(); }
+  };
+
+  server.registerTool("create_folder", {
+    title: "Create Folder",
+    description: "Creates a new folder (or subfolder) in the AFFiNE organise sidebar. Returns the new folder's ID. Use parentId to nest inside an existing folder.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      name: z.string().min(1).describe("Display name for the new folder."),
+      parentId: z.string().optional().describe("ID of the parent folder. Omit to create a top-level folder."),
+    },
+  }, createFolderHandler as any);
+
+  // ─── move_doc_to_folder ──────────────────────────────────────────────────────
+
+  const moveDocToFolderHandler = async (parsed: { workspaceId?: string; docId: string; folderId: string }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const { foldersDocId, ydoc, prevSV } = await loadFoldersDoc(workspaceId, socket);
+      const nodes = readFolderNodes(ydoc);
+
+      const folder = nodes.find(n => n.id === parsed.folderId && n.type === "folder");
+      if (!folder) throw new Error(`Folder not found: ${parsed.folderId}. Use list_folders to find valid folder IDs.`);
+
+      const existing = nodes.find(n => n.type === "doc" && n.data === parsed.docId && n.parentId === parsed.folderId);
+      if (existing) return text({ linked: true, alreadyPresent: true, rowId: existing.id, docId: parsed.docId, folderId: parsed.folderId });
+
+      const rowId = generateId();
+      const row = ydoc.getMap(rowId);
+      row.set("id", rowId);
+      row.set("parentId", parsed.folderId);
+      row.set("type", "doc");
+      row.set("data", parsed.docId);
+      row.set("index", generateFolderIndex());
+
+      const delta = Y.encodeStateAsUpdate(ydoc, prevSV);
+      await pushDocUpdate(socket, workspaceId, foldersDocId, Buffer.from(delta).toString("base64"));
+      return text({ linked: true, alreadyPresent: false, rowId, docId: parsed.docId, folderId: parsed.folderId });
+    } finally { socket.disconnect(); }
+  };
+
+  server.registerTool("move_doc_to_folder", {
+    title: "Move Doc to Folder",
+    description: "Adds a doc link into an organise-sidebar folder. The doc remains in the workspace; this creates a reference in the folder tree. The same doc can be linked into multiple folders.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      docId: z.string().min(1).describe("ID of the doc to link into the folder."),
+      folderId: z.string().min(1).describe("ID of the target folder. Use list_folders to find folder IDs."),
+    },
+  }, moveDocToFolderHandler as any);
+
+  // ─── rename_folder ───────────────────────────────────────────────────────────
+
+  const renameFolderHandler = async (parsed: { workspaceId?: string; folderId: string; name: string }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const { foldersDocId, ydoc, prevSV } = await loadFoldersDoc(workspaceId, socket);
+      const nodes = readFolderNodes(ydoc);
+
+      const folder = nodes.find(n => n.id === parsed.folderId && n.type === "folder");
+      if (!folder) throw new Error(`Folder not found: ${parsed.folderId}. Use list_folders to find valid folder IDs.`);
+
+      const row = ydoc.getMap(parsed.folderId);
+      row.set("data", parsed.name);
+
+      const delta = Y.encodeStateAsUpdate(ydoc, prevSV);
+      await pushDocUpdate(socket, workspaceId, foldersDocId, Buffer.from(delta).toString("base64"));
+      return text({ renamed: true, folderId: parsed.folderId, name: parsed.name });
+    } finally { socket.disconnect(); }
+  };
+
+  server.registerTool("rename_folder", {
+    title: "Rename Folder",
+    description: "Renames an existing folder in the AFFiNE organise sidebar.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      folderId: z.string().min(1).describe("ID of the folder to rename. Use list_folders to find folder IDs."),
+      name: z.string().min(1).describe("New display name for the folder."),
+    },
+  }, renameFolderHandler as any);
+
+  // ─── move_folder ─────────────────────────────────────────────────────────────
+
+  const moveFolderHandler = async (parsed: { workspaceId?: string; folderId: string; newParentId?: string }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const { foldersDocId, ydoc, prevSV } = await loadFoldersDoc(workspaceId, socket);
+      const nodes = readFolderNodes(ydoc);
+
+      const folder = nodes.find(n => n.id === parsed.folderId && n.type === "folder");
+      if (!folder) throw new Error(`Folder not found: ${parsed.folderId}. Use list_folders to find valid folder IDs.`);
+
+      if (parsed.newParentId) {
+        const newParent = nodes.find(n => n.id === parsed.newParentId && n.type === "folder");
+        if (!newParent) throw new Error(`Target parent folder not found: ${parsed.newParentId}.`);
+
+        // Cycle check: newParentId must not be the folder itself or any of its descendants
+        const descendants = new Set<string>();
+        const collect = (id: string) => {
+          descendants.add(id);
+          for (const n of nodes) {
+            if (n.parentId === id && n.type === "folder") collect(n.id);
+          }
+        };
+        collect(parsed.folderId);
+        if (descendants.has(parsed.newParentId)) {
+          throw new Error(`Cannot move folder into itself or one of its descendants.`);
+        }
+      }
+
+      const row = ydoc.getMap(parsed.folderId);
+      row.set("parentId", parsed.newParentId ?? null);
+
+      const delta = Y.encodeStateAsUpdate(ydoc, prevSV);
+      await pushDocUpdate(socket, workspaceId, foldersDocId, Buffer.from(delta).toString("base64"));
+      return text({ moved: true, folderId: parsed.folderId, newParentId: parsed.newParentId ?? null });
+    } finally { socket.disconnect(); }
+  };
+
+  server.registerTool("move_folder", {
+    title: "Move Folder",
+    description: "Moves a folder to a different parent in the AFFiNE organise sidebar. Omit newParentId to move to the top level. Prevents moving a folder into itself or its own descendants.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      folderId: z.string().min(1).describe("ID of the folder to move. Use list_folders to find folder IDs."),
+      newParentId: z.string().optional().describe("ID of the new parent folder. Omit to move to the top level."),
+    },
+  }, moveFolderHandler as any);
 }
