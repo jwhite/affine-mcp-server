@@ -59,6 +59,18 @@ export type MarkdownOperation =
       type: "bookmark";
       url: string;
       caption?: string;
+    }
+  | {
+      type: "image";
+      url: string;          // http(s)://, data:, or affine://blob/<sourceId>
+      alt?: string;
+      // Populated once the image is resolved to a workspace blob (via
+      // autoUploadImages or an already-resolved affine://blob/ URL).  When
+      // present, the operation becomes a real image block; otherwise the
+      // applier falls back to a bookmark.
+      sourceId?: string;
+      mimeType?: string;
+      size?: number;
     };
 
 export type MarkdownParseResult = {

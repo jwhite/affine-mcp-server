@@ -519,9 +519,10 @@ function parseTokens(tokens: TokenLike[], start: number, end: number, state: Par
           const src = getAttr(imageToken, "src");
           const alt = imageToken.content || undefined;
           if (src) {
-            state.unsupportedCount += 1;
-            addWarning(state, "Markdown images were imported as bookmark blocks (external image blobs are not auto-uploaded).");
-            state.operations.push({ type: "bookmark", url: src, caption: alt });
+            // Emit an image operation; the applier decides whether to resolve
+            // it to a workspace blob (autoUploadImages) or fall back to a
+            // bookmark block.  Warnings are attached at apply time, not here.
+            state.operations.push({ type: "image", url: src, alt });
           }
           i = close + 1;
           break;
