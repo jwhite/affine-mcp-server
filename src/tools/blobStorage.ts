@@ -21,48 +21,53 @@ function decodeBlobContent(content: string): Buffer {
   return Buffer.from(content, "utf8");
 }
 
+// Direct bytes-to-blob upload — bypasses the base64 round-trip the
+// upload_blob tool does on string input.  Used by markdown image
+// auto-upload, which already has the raw bytes in hand.
+export async function uploadBlobBytes(
+  gql: GraphQLClient,
+  workspaceId: string,
+  bytes: Buffer,
+  filename: string,
+  contentType: string
+): Promise<string> {
+  const endpoint = gql.endpoint;
+  const headers = gql.headers;
+  const cookie = gql.cookie;
+  const form = new FormData();
+  form.append("operations", JSON.stringify({
+    query: `mutation SetBlob($workspaceId: String!, $blob: Upload!) {
+      setBlob(workspaceId: $workspaceId, blob: $blob)
+    }`,
+    variables: { workspaceId, blob: null },
+  }));
+  form.append("map", JSON.stringify({ "0": ["variables.blob"] }));
+  form.append("0", bytes, { filename, contentType });
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { ...headers, Cookie: cookie, ...form.getHeaders() },
+    body: form as any,
+  });
+  const result = await response.json() as any;
+  if (result.errors?.length) {
+    throw new Error(result.errors[0].message);
+  }
+  const blobKey = result.data?.setBlob;
+  if (!blobKey) {
+    throw new Error("Upload succeeded but no blob key was returned.");
+  }
+  return blobKey as string;
+}
+
 export function registerBlobTools(server: McpServer, gql: GraphQLClient) {
   // UPLOAD BLOB/FILE
   const uploadBlobHandler = async ({ workspaceId, content, filename, contentType }: { workspaceId: string; content: string; filename?: string; contentType?: string }) => {
     try {
-      const endpoint = gql.endpoint;
-      const headers = gql.headers;
-      const cookie = gql.cookie;
       const payload = decodeBlobContent(content);
       const safeFilename = filename || `blob-${Date.now()}.bin`;
       const mime = contentType || "application/octet-stream";
-
-      const form = new FormData();
-      form.append("operations", JSON.stringify({
-        query: `mutation SetBlob($workspaceId: String!, $blob: Upload!) {
-          setBlob(workspaceId: $workspaceId, blob: $blob)
-        }`,
-        variables: {
-          workspaceId,
-          blob: null
-        }
-      }));
-      form.append("map", JSON.stringify({ "0": ["variables.blob"] }));
-      form.append("0", payload, { filename: safeFilename, contentType: mime });
-
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          ...headers,
-          Cookie: cookie,
-          ...form.getHeaders(),
-        },
-        body: form as any,
-      });
-      const result = await response.json() as any;
-      if (result.errors?.length) {
-        throw new Error(result.errors[0].message);
-      }
-      const blobKey = result.data?.setBlob;
-      if (!blobKey) {
-        throw new Error("Upload succeeded but no blob key was returned.");
-      }
-
+      const blobKey = await uploadBlobBytes(gql, workspaceId, payload, safeFilename, mime);
       return text({
         id: blobKey,
         key: blobKey,

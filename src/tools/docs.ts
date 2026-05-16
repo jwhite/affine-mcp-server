@@ -7,8 +7,10 @@ import { wsUrlFromGraphQLEndpoint, connectWorkspaceSocket, joinWorkspace, loadDo
 import * as Y from "yjs";
 import { parseMarkdownToOperations } from "../markdown/parse.js";
 import { renderBlocksToMarkdown } from "../markdown/render.js";
+import { resolveImageOperations, resolveMarkdownImage } from "../markdown/imageResolver.js";
 import type { MarkdownOperation, MarkdownRenderableBlock, TextDelta } from "../markdown/types.js";
 import { addOrganizeLinkToFolder } from "./organize.js";
+import { uploadBlobBytes } from "./blobStorage.js";
 import {
   type Bound,
   DEFAULT_NOTE_XYWH,
@@ -2483,6 +2485,31 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           type: "bookmark",
           url: operation.url,
           caption: operation.caption,
+          strict,
+          placement,
+        };
+      case "image":
+        // If image resolution populated a sourceId, create a real image block.
+        // Otherwise fall back to a bookmark so the original URL is preserved.
+        if (operation.sourceId) {
+          return {
+            workspaceId,
+            docId,
+            type: "image",
+            sourceId: operation.sourceId,
+            caption: operation.alt,
+            mimeType: operation.mimeType,
+            size: operation.size,
+            strict,
+            placement,
+          };
+        }
+        return {
+          workspaceId,
+          docId,
+          type: "bookmark",
+          url: operation.url,
+          caption: operation.alt,
           strict,
           placement,
         };
@@ -5371,10 +5398,45 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     stackAfter?: { blockId: string | string[]; direction?: "down" | "up" | "right" | "left"; gap?: number };
     padding?: number;
   }) => {
+    // For type='image' with a URL but no sourceId, fetch/decode the image and
+    // upload it as a workspace blob so the rest of the pipeline sees a normal
+    // image block.  http(s):// is fetched; data: is decoded; affine://blob/
+    // is used directly.  Failures throw — the caller asked for an image, and
+    // silently falling back to a bookmark would be surprising here.
+    let imageResolved: { sourceId: string; mimeType?: string; size?: number } | null = null;
+    if (parsed.type === "image" && parsed.url && !parsed.sourceId) {
+      const workspaceId = parsed.workspaceId || defaults.workspaceId;
+      if (!workspaceId) {
+        throw new Error("workspaceId is required to auto-upload image URLs.");
+      }
+      const resolved = await resolveMarkdownImage({
+        url: parsed.url,
+        upload: ({ bytes, contentType, filename }) =>
+          uploadBlobBytes(gql, workspaceId, bytes, filename, contentType),
+      });
+      if (resolved.kind === "resolved") {
+        imageResolved = { sourceId: resolved.sourceId, mimeType: resolved.mimeType, size: resolved.size };
+      } else if (resolved.kind === "passthrough") {
+        imageResolved = { sourceId: resolved.sourceId };
+      } else {
+        throw new Error(`Could not resolve image URL '${parsed.url}': ${resolved.reason}`);
+      }
+    }
+
     // Drop `text` when `markdown` is set so markdown-parsed children don't
     // sit next to a stale one-paragraph echo.
     const shouldApplyMarkdown = parsed.type === "note" && !!parsed.markdown;
-    const coreParsed = shouldApplyMarkdown ? { ...parsed, text: undefined } : parsed;
+    const coreParsed = shouldApplyMarkdown
+      ? { ...parsed, text: undefined }
+      : imageResolved
+        ? {
+            ...parsed,
+            sourceId: imageResolved.sourceId,
+            mimeType: parsed.mimeType ?? imageResolved.mimeType,
+            size: parsed.size ?? imageResolved.size,
+            url: undefined,
+          }
+        : parsed;
     const result = await appendBlockInternal(coreParsed);
 
     let markdownApplied: {
@@ -5427,7 +5489,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         docId: DocId,
         type: z.string().min(1).describe("Block type. Canonical: paragraph|heading|quote|list|code|divider|callout|latex|table|bookmark|image|attachment|embed_youtube|embed_github|embed_figma|embed_loom|embed_html|embed_linked_doc|embed_synced_doc|embed_iframe|database|data_view|surface_ref|frame|edgeless_text|note. Legacy aliases remain supported."),
         text: z.string().optional().describe("Block content text"),
-        url: z.string().optional().describe("URL for bookmark/embeds"),
+        url: z.string().optional().describe("URL for bookmark/embeds. For type='image' without a sourceId, this URL is fetched (http(s)://), decoded (data:), or passed through (affine://blob/) and uploaded as a workspace blob — yielding an image block automatically."),
         pageId: z.string().optional().describe("Target page/doc id for linked/synced doc embeds"),
         iframeUrl: z.string().optional().describe("Override iframe src for embed_iframe"),
         html: z.string().optional().describe("Raw html for embed_html"),
@@ -5663,12 +5725,20 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
   // Core logic for creating a doc from markdown — returns structured data, no MCP envelope.
   // Used by createDocFromMarkdownHandler and internal markdown-based flows.
+  // Build an uploader bound to a specific workspace, suitable for passing to
+  // resolveImageOperations.  Returns the blob's sourceId on success.
+  function makeWorkspaceUploader(workspaceId: string) {
+    return async ({ bytes, contentType, filename }: { bytes: Buffer; contentType: string; filename: string }) =>
+      uploadBlobBytes(gql, workspaceId, bytes, filename, contentType);
+  }
+
   const createDocFromMarkdownCore = async (parsed: {
     workspaceId?: string;
     title?: string;
     markdown: string;
     strict?: boolean;
     parentDocId?: string;
+    autoUploadImages?: boolean;
   }) => {
     const parsedMarkdown = parseMarkdownToOperations(parsed.markdown);
     let operations = [...parsedMarkdown.operations];
@@ -5688,6 +5758,18 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       workspaceId: parsed.workspaceId,
       title,
     });
+
+    // Resolve any image operations to workspace blobs before applying.  When
+    // autoUploadImages is off, image ops fall through to bookmark blocks at
+    // the apply step (no network I/O happens here).
+    const imageWarnings: string[] = [];
+    if (parsed.autoUploadImages && operations.some(op => op.type === "image")) {
+      const resolved = await resolveImageOperations(operations, {
+        upload: makeWorkspaceUploader(created.workspaceId),
+      });
+      operations = resolved.operations;
+      imageWarnings.push(...resolved.warnings);
+    }
 
     let applied = {
       appendedCount: 0,
@@ -5722,7 +5804,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       title: created.title,
       parentDocId: placement.parentDocId,
       linkedToParent: placement.linkedToParent,
-      warnings: mergeWarnings(parsedMarkdown.warnings, applyWarnings, placement.warnings),
+      warnings: mergeWarnings(parsedMarkdown.warnings, imageWarnings, applyWarnings, placement.warnings),
       lossy: parsedMarkdown.lossy || applied.skippedCount > 0,
       stats: {
         parsedBlocks: parsedMarkdown.operations.length,
@@ -5738,6 +5820,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     markdown: string;
     strict?: boolean;
     parentDocId?: string;
+    autoUploadImages?: boolean;
   }) => {
     return receipt("doc.create_from_markdown", await createDocFromMarkdownCore(parsed));
   };
@@ -5752,6 +5835,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         markdown: MarkdownContent.describe("Markdown content to import"),
         strict: z.boolean().optional(),
         parentDocId: z.string().optional().describe("If provided, the new doc is automatically embedded into this parent doc as a linked child (visible in sidebar)."),
+        autoUploadImages: z.boolean().optional().describe("When true, ![alt](url) images are fetched/decoded and uploaded as workspace blobs, producing real image blocks. http(s):// and data: URLs are uploaded; affine://blob/ URLs are used directly. Failures fall back to bookmark blocks with a warning. Default false."),
       },
     },
     createDocFromMarkdownHandler as any
@@ -5875,6 +5959,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     docId: string;
     markdown: string;
     strict?: boolean;
+    autoUploadImages?: boolean;
   }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) {
@@ -5882,10 +5967,19 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     }
 
     const parsedMarkdown = parseMarkdownToOperations(parsed.markdown);
+    let operations = parsedMarkdown.operations;
+    const imageWarnings: string[] = [];
+    if (parsed.autoUploadImages && operations.some(op => op.type === "image")) {
+      const resolved = await resolveImageOperations(operations, {
+        upload: makeWorkspaceUploader(workspaceId),
+      });
+      operations = resolved.operations;
+      imageWarnings.push(...resolved.warnings);
+    }
     const applied = await applyMarkdownOperationsInternal({
       workspaceId,
       docId: parsed.docId,
-      operations: parsedMarkdown.operations,
+      operations,
       strict: parsed.strict,
       replaceExisting: true,
     });
@@ -5899,7 +5993,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       workspaceId,
       docId: parsed.docId,
       replaced: true,
-      warnings: mergeWarnings(parsedMarkdown.warnings, applyWarnings),
+      warnings: mergeWarnings(parsedMarkdown.warnings, imageWarnings, applyWarnings),
       lossy: parsedMarkdown.lossy || applied.skippedCount > 0,
       stats: {
         parsedBlocks: parsedMarkdown.operations.length,
@@ -5918,6 +6012,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         docId: DocId,
         markdown: MarkdownContent.describe("Markdown content to replace with"),
         strict: z.boolean().optional(),
+        autoUploadImages: z.boolean().optional().describe("When true, ![alt](url) images are fetched/decoded and uploaded as workspace blobs, producing real image blocks. See create_doc_from_markdown for details. Default false."),
       },
     },
     replaceDocWithMarkdownHandler as any
