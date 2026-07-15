@@ -22,6 +22,7 @@ import { startHttpMcpServer } from "./sse.js";
 import { existsSync } from "fs";
 import { CONFIG_FILE } from "./config.js";
 import { createToolFilter, toolAnnotationsFor, toolFilterRequiresRegisterTool } from "./toolSurface.js";
+import { resolveToolLogMode, withToolLogging } from "./toolLogging.js";
 
 // CLI commands: affine-mcp login|status|logout|version
 const rawArgs = process.argv.slice(2);
@@ -53,6 +54,7 @@ const useHttpTransport =
 
 // Tool filtering is parsed once at module load (not per-session in HTTP mode).
 const toolFilter = createToolFilter(process.env);
+const toolLogMode = resolveToolLogMode(process.env.AFFINE_MCP_LOG_TOOLS);
 
 // Startup diagnostics (visible in Claude Code MCP server logs via stderr)
 console.error(`[affine-mcp] Config: ${CONFIG_FILE} (${existsSync(CONFIG_FILE) ? 'found' : 'missing'})`);
@@ -176,13 +178,14 @@ async function buildServer() {
           ...toolAnnotationsFor(name),
           ...(options?.annotations || {}),
         },
-      }, handler);
+      }, withToolLogging(name, handler, toolLogMode));
     };
   }
   console.error(`[affine-mcp] Tool profile: ${toolFilter.profile}`);
   console.error(`[affine-mcp] Disabled groups: ${process.env.AFFINE_DISABLED_GROUPS || "(none)"}`);
   console.error(`[affine-mcp] Disabled tools: ${process.env.AFFINE_DISABLED_TOOLS || "(none)"}`);
   console.error(`[affine-mcp] Enabled tools: ${toolFilter.enabledTools.length}/${toolFilter.totalToolCount}`);
+  console.error(`[affine-mcp] Tool call logging: ${toolLogMode} (AFFINE_MCP_LOG_TOOLS=off|basic|verbose)`);
 
   registerWorkspaceTools(server, gql);
   registerDocTools(server, gql, { workspaceId: config.defaultWorkspaceId });

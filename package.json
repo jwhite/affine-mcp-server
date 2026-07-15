@@ -74,6 +74,7 @@
     "test:markdown-rich-text-import-live": "node tests/test-markdown-rich-text-import-live.mjs",
     "test:markdown-rich-text-export": "node tests/test-markdown-rich-text-export.mjs",
     "test:markdown-image-resolver": "node tests/test-markdown-image-resolver.mjs",
+    "test:markdown-detect": "node tests/test-markdown-detect.mjs",
     "test:playwright": "npx playwright test --config tests/playwright/playwright.config.ts",
     "pack:check": "npm pack --dry-run",
     "ci": "npm run build && npm run test:tool-manifest && npm run pack:check",

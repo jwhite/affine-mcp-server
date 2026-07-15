@@ -5,6 +5,7 @@ import { GraphQLClient } from "../graphqlClient.js";
 import { receipt, text } from "../util/mcp.js";
 import { wsUrlFromGraphQLEndpoint, connectWorkspaceSocket, joinWorkspace, loadDoc, pushDocUpdate, deleteDoc as wsDeleteDoc } from "../ws.js";
 import * as Y from "yjs";
+import { looksLikeMultiBlockMarkdown } from "../markdown/detect.js";
 import { parseMarkdownToOperations } from "../markdown/parse.js";
 import { renderBlocksToMarkdown } from "../markdown/render.js";
 import { resolveImageOperations, resolveMarkdownImage } from "../markdown/imageResolver.js";
@@ -115,6 +116,19 @@ const APPEND_BLOCK_LEGACY_ALIAS_MAP = {
   todo: "list",
 } as const;
 type AppendBlockLegacyType = keyof typeof APPEND_BLOCK_LEGACY_ALIAS_MAP;
+
+/**
+ * Block types whose `text` is prose, and so must never swallow a whole markdown
+ * document verbatim. Excluded on purpose: code/latex keep their text literal by
+ * definition, and table/note/embeds carry content in dedicated params.
+ */
+const MARKDOWN_AUTOPARSE_TYPES: ReadonlySet<AppendBlockCanonicalType> = new Set([
+  "paragraph",
+  "heading",
+  "quote",
+  "list",
+  "callout",
+]);
 
 const APPEND_BLOCK_LIST_STYLE_VALUES = ["bulleted", "numbered", "todo"] as const;
 type AppendBlockListStyle = typeof APPEND_BLOCK_LIST_STYLE_VALUES[number];
@@ -5220,7 +5234,14 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
   // CREATE DOC (high-level)
   const createDocHandler = async (parsed: { workspaceId?: string; title?: string; content?: string; parentDocId?: string; folderId?: string }) => {
-    const created = await createDocInternal(parsed);
+    // `content` writes verbatim into a single paragraph, but callers routinely pass a
+    // whole markdown document to it — it reads as "the content" and the tool sits next
+    // to create_doc_from_markdown. Stored raw, AFFiNE renders the literal source
+    // ("###", "|---|"), so parse it into real blocks instead. See markdown/detect.ts.
+    const contentIsMarkdown = !!parsed.content && looksLikeMultiBlockMarkdown(parsed.content);
+    const created = await createDocInternal(
+      contentIsMarkdown ? { ...parsed, content: undefined } : parsed
+    );
     const placement = await finalizeDocPlacement({
       workspaceId: created.workspaceId,
       docId: created.docId,
@@ -5249,6 +5270,27 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         socket.disconnect();
       }
     }
+    let markdownStats: { parsedBlocks: number; appliedBlocks: number; skippedBlocks: number } | undefined;
+    if (contentIsMarkdown && parsed.content) {
+      const parsedMarkdown = parseMarkdownToOperations(parsed.content);
+      const applied = await applyMarkdownOperationsInternal({
+        workspaceId: created.workspaceId,
+        docId: created.docId,
+        operations: parsedMarkdown.operations,
+      });
+      markdownStats = {
+        parsedBlocks: parsedMarkdown.operations.length,
+        appliedBlocks: applied.appendedCount,
+        skippedBlocks: applied.skippedCount,
+      };
+      warnings.push(
+        "content contained markdown structure and was parsed into blocks. Call create_doc_from_markdown directly to control this (e.g. autoUploadImages), or pass single-line text to store it verbatim."
+      );
+      warnings.push(...parsedMarkdown.warnings);
+      if (applied.skippedCount > 0) {
+        warnings.push(`${applied.skippedCount} markdown block(s) could not be applied to AFFiNE and were skipped.`);
+      }
+    }
     return receipt("doc.create", {
       workspaceId: created.workspaceId,
       docId: created.docId,
@@ -5258,6 +5300,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       folderId: linkedFolderId,
       folderLinked: folderNodeId !== null,
       folderNodeId,
+      contentParsedAsMarkdown: contentIsMarkdown,
+      ...(markdownStats ? { stats: markdownStats } : {}),
       warnings,
     });
   };
@@ -5265,11 +5309,11 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     'create_doc',
     {
       title: 'Create Document',
-      description: 'Create a new AFFiNE document with optional content. If parentDocId is provided, the new doc is linked into the sidebar tree immediately. If folderId is provided, the doc is placed inside that folder in the sidebar.',
+      description: 'Create a new AFFiNE document with optional content. Content containing markdown structure (headings, tables, lists, code fences) is parsed into real blocks; prefer create_doc_from_markdown when you know the content is markdown. If parentDocId is provided, the new doc is linked into the sidebar tree immediately. If folderId is provided, the doc is placed inside that folder in the sidebar.',
       inputSchema: {
         workspaceId: WorkspaceId.optional(),
         title: z.string().optional().describe("Optional initial document title."),
-        content: z.string().optional().describe("Optional initial plain text or markdown-like content."),
+        content: z.string().optional().describe("Optional initial content. Single-line/plain text is stored verbatim. Multi-line content with markdown block structure (headings, tables, lists, code fences, quotes) is parsed into AFFiNE blocks — use create_doc_from_markdown for explicit control."),
         parentDocId: z.string().optional().describe("Optional parent doc to link the new doc under in the sidebar."),
         folderId: z.string().optional().describe("Optional folder ID to place the doc in. Use list_organize_nodes to find folder IDs."),
       },
@@ -5425,6 +5469,53 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
     // Drop `text` when `markdown` is set so markdown-parsed children don't
     // sit next to a stale one-paragraph echo.
+    // `text` writes verbatim into a single block, so a whole markdown document passed
+    // here renders as literal source — this is how a 10k-char doc became one bulleted
+    // list block showing raw "###" and "|---|". Parse it into real blocks instead.
+    // Only prose types qualify (see MARKDOWN_AUTOPARSE_TYPES); `markdown` wins if set.
+    const textIsMarkdown =
+      !parsed.markdown &&
+      !!parsed.text &&
+      looksLikeMultiBlockMarkdown(parsed.text) &&
+      MARKDOWN_AUTOPARSE_TYPES.has(normalizeBlockTypeInput(parsed.type).type);
+
+    if (textIsMarkdown && parsed.text) {
+      const workspaceId = parsed.workspaceId || defaults.workspaceId;
+      if (!workspaceId) {
+        throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
+      }
+      const parsedMd = parseMarkdownToOperations(parsed.text);
+      const applied = await applyMarkdownOperationsInternal({
+        workspaceId,
+        docId: parsed.docId,
+        operations: parsedMd.operations,
+        strict: parsed.strict,
+        placement: parsed.placement,
+      });
+      const autoWarnings = [
+        `text contained markdown structure spanning multiple blocks; it was parsed into ${applied.appendedCount} block(s) rather than stored verbatim as one '${parsed.type}' block. Call append_markdown directly for explicit control.`,
+        ...parsedMd.warnings,
+      ];
+      if (applied.skippedCount > 0) {
+        autoWarnings.push(`${applied.skippedCount} markdown block(s) could not be applied to AFFiNE and were skipped.`);
+      }
+      return receipt("doc.append_block", {
+        workspaceId,
+        docId: parsed.docId,
+        appended: applied.appendedCount > 0,
+        blockId: applied.blockIds[0] ?? null,
+        blockIds: applied.blockIds,
+        textParsedAsMarkdown: true,
+        warnings: autoWarnings,
+        lossy: parsedMd.lossy || applied.skippedCount > 0,
+        stats: {
+          parsedBlocks: parsedMd.operations.length,
+          appliedBlocks: applied.appendedCount,
+          skippedBlocks: applied.skippedCount,
+        },
+      });
+    }
+
     const shouldApplyMarkdown = parsed.type === "note" && !!parsed.markdown;
     const coreParsed = shouldApplyMarkdown
       ? { ...parsed, text: undefined }
@@ -5488,7 +5579,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         workspaceId: WorkspaceId.optional(),
         docId: DocId,
         type: z.string().min(1).describe("Block type. Canonical: paragraph|heading|quote|list|code|divider|callout|latex|table|bookmark|image|attachment|embed_youtube|embed_github|embed_figma|embed_loom|embed_html|embed_linked_doc|embed_synced_doc|embed_iframe|database|data_view|surface_ref|frame|edgeless_text|note. Legacy aliases remain supported."),
-        text: z.string().optional().describe("Block content text"),
+        text: z.string().optional().describe("Block content text. Stored verbatim for a single block. If this contains markdown block structure (headings, tables, lists, code fences, quotes) and the type is a prose type (paragraph/heading/quote/list/callout), it is parsed into multiple blocks instead of being stored as literal markdown source — use append_markdown for explicit control."),
         url: z.string().optional().describe("URL for bookmark/embeds. For type='image' without a sourceId, this URL is fetched (http(s)://), decoded (data:), or passed through (affine://blob/) and uploaded as a workspace blob — yielding an image block automatically."),
         pageId: z.string().optional().describe("Target page/doc id for linked/synced doc embeds"),
         iframeUrl: z.string().optional().describe("Override iframe src for embed_iframe"),
