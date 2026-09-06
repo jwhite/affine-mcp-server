@@ -37,6 +37,7 @@ import {
 import * as Y from "yjs";
 import { parseMarkdownToOperations } from "../markdown/parse.js";
 import { renderBlocksToMarkdown } from "../markdown/render.js";
+import { looksLikeMultiBlockMarkdown } from "../markdown/detect.js";
 import { richTextValueToDeltas, richTextValueToString } from "../markdown/richText.js";
 import { buildMarkdownFrontmatter } from "../markdown/safety.js";
 import type { MarkdownOperation, MarkdownRenderableBlock, TextDelta } from "../markdown/types.js";
@@ -6081,7 +6082,14 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     if (!workspaceId) {
       throw new Error("workspaceId is required. Provide it or set AFFINE_WORKSPACE_ID.");
     }
-    const created = await createDocInternal({ ...parsed, workspaceId });
+    // `content` writes verbatim into a single paragraph, but callers routinely pass a
+    // whole markdown document to it — it reads as "the content" and the tool sits next
+    // to create_doc_from_markdown. Stored raw, AFFiNE renders the literal source
+    // ("###", "|---|"), so parse it into real blocks instead. See markdown/detect.ts.
+    const contentIsMarkdown = !!parsed.content && looksLikeMultiBlockMarkdown(parsed.content);
+    const created = await createDocInternal(
+      contentIsMarkdown ? { ...parsed, workspaceId, content: undefined } : { ...parsed, workspaceId }
+    );
     const placement = await finalizeDocPlacement({
       workspaceId: created.workspaceId,
       docId: created.docId,
@@ -6110,6 +6118,27 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         socket.disconnect();
       }
     }
+    let markdownStats: { parsedBlocks: number; appliedBlocks: number; skippedBlocks: number } | undefined;
+    if (contentIsMarkdown && parsed.content) {
+      const parsedMarkdown = parseMarkdownToOperations(parsed.content);
+      const applied = await applyMarkdownOperationsInternal({
+        workspaceId: created.workspaceId,
+        docId: created.docId,
+        operations: parsedMarkdown.operations,
+      });
+      markdownStats = {
+        parsedBlocks: parsedMarkdown.operations.length,
+        appliedBlocks: applied.appendedCount,
+        skippedBlocks: applied.skippedCount,
+      };
+      warnings.push(
+        "content contained markdown structure and was parsed into blocks. Call create_doc_from_markdown directly to control this (e.g. autoUploadImages), or pass single-line text to store it verbatim."
+      );
+      warnings.push(...parsedMarkdown.warnings);
+      if (applied.skippedCount > 0) {
+        warnings.push(`${applied.skippedCount} markdown block(s) could not be applied to AFFiNE and were skipped.`);
+      }
+    }
     return receipt("doc.create", {
       workspaceId: created.workspaceId,
       docId: created.docId,
@@ -6121,6 +6150,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       folderId: linkedFolderId,
       folderLinked: folderNodeId !== null,
       folderNodeId,
+      contentParsedAsMarkdown: contentIsMarkdown,
+      ...(markdownStats ? { stats: markdownStats } : {}),
       warnings,
     });
   };
