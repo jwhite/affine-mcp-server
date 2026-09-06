@@ -38,6 +38,16 @@ import * as Y from "yjs";
 import { parseMarkdownToOperations } from "../markdown/parse.js";
 import { renderBlocksToMarkdown } from "../markdown/render.js";
 import { looksLikeMultiBlockMarkdown } from "../markdown/detect.js";
+
+/** Prose block types whose `text` is body content. A multi-block markdown document dumped
+ *  into append_block.text for these should be parsed into real blocks, not stored raw. */
+const MARKDOWN_AUTOPARSE_TYPES: ReadonlySet<string> = new Set([
+  "paragraph",
+  "heading",
+  "quote",
+  "list",
+  "callout",
+]);
 import { richTextValueToDeltas, richTextValueToString } from "../markdown/richText.js";
 import { buildMarkdownFrontmatter } from "../markdown/safety.js";
 import type { MarkdownOperation, MarkdownRenderableBlock, TextDelta } from "../markdown/types.js";
@@ -6292,6 +6302,53 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     stackAfter?: { blockId: string | string[]; direction?: "down" | "up" | "right" | "left"; gap?: number };
     padding?: number;
   }) => {
+    // Drop `text` when `markdown` is set so markdown-parsed children don't
+    // sit next to a stale one-paragraph echo.
+    // AUTO-PARSE: a whole markdown document passed to `text` renders as literal source
+    // ("###", "|---|") in one block. When `text` is a *string* (not a delta array),
+    // `markdown` is unset, it carries multi-block markdown structure, and the block type
+    // is a prose type, parse it into real blocks instead. See markdown/detect.ts.
+    const textIsMarkdown =
+      !parsed.markdown &&
+      typeof parsed.text === "string" &&
+      looksLikeMultiBlockMarkdown(parsed.text) &&
+      MARKDOWN_AUTOPARSE_TYPES.has(normalizeBlockTypeInput(parsed.type).type);
+    if (textIsMarkdown && typeof parsed.text === "string") {
+      const workspaceId = parsed.workspaceId || defaults.workspaceId;
+      if (!workspaceId) {
+        throw new Error("workspaceId is required. Provide it or set AFFINE_WORKSPACE_ID.");
+      }
+      const parsedMd = parseMarkdownToOperations(parsed.text);
+      const applied = await applyMarkdownOperationsInternal({
+        workspaceId,
+        docId: parsed.docId,
+        operations: parsedMd.operations,
+        strict: parsed.strict,
+        placement: parsed.placement,
+      });
+      const autoWarnings = [
+        `text contained markdown structure spanning multiple blocks; it was parsed into ${applied.appendedCount} block(s) rather than stored verbatim as one '${parsed.type}' block. Call append_markdown directly for explicit control.`,
+        ...parsedMd.warnings,
+      ];
+      if (applied.skippedCount > 0) {
+        autoWarnings.push(`${applied.skippedCount} markdown block(s) could not be applied to AFFiNE and were skipped.`);
+      }
+      return receipt("doc.append_block", {
+        workspaceId,
+        docId: parsed.docId,
+        appended: applied.appendedCount > 0,
+        blockId: applied.blockIds[0] ?? null,
+        blockIds: applied.blockIds,
+        textParsedAsMarkdown: true,
+        warnings: autoWarnings,
+        lossy: parsedMd.lossy || applied.skippedCount > 0,
+        stats: {
+          parsedBlocks: parsedMd.operations.length,
+          appliedBlocks: applied.appendedCount,
+          skippedBlocks: applied.skippedCount,
+        },
+      });
+    }
     // Drop `text` when `markdown` is set so markdown-parsed children don't
     // sit next to a stale one-paragraph echo.
     const shouldApplyMarkdown = parsed.type === "note" && !!parsed.markdown;
