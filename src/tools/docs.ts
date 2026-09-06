@@ -51,6 +51,7 @@ import {
   richTextValueToDeltas,
   richTextValueToString,
 } from "../markdown/richText.js";
+import { looksLikeMultiBlockMarkdown } from "../markdown/detect.js";
 import { buildMarkdownFrontmatter } from "../markdown/safety.js";
 import type { MarkdownOperation, MarkdownRenderableBlock, TextDelta } from "../markdown/types.js";
 import { addOrganizeLinkToFolder } from "./organize.js";
@@ -6631,8 +6632,16 @@ export function registerDocTools(
     if (!workspaceId) {
       throw new Error("workspaceId is required. Provide it or set AFFINE_WORKSPACE_ID.");
     }
+    // `content` writes verbatim into a single paragraph, but callers routinely pass a
+    // whole markdown document to it — it reads as "the content" and the tool sits next
+    // to create_doc_from_markdown. Stored raw, AFFiNE renders the literal source
+    // ("###", "|---|"), so parse it into real blocks instead. See markdown/detect.ts.
+    // Upstream only warns about this (createDocContentWarnings); this fork converts.
+    const contentIsMarkdown = !!parsed.content && looksLikeMultiBlockMarkdown(parsed.content);
     try {
-      const created = await createDocInternal({ ...parsed, workspaceId });
+      const created = await createDocInternal(
+        contentIsMarkdown ? { ...parsed, workspaceId, content: undefined } : { ...parsed, workspaceId },
+      );
       const placement = await finalizeDocPlacement({
         workspaceId: created.workspaceId,
         docId: created.docId,
@@ -6644,11 +6653,30 @@ export function registerDocTools(
         docId: created.docId,
         folderId: parsed.folderId,
       });
+      let markdownStats: { parsedBlocks: number; appliedBlocks: number; skippedBlocks: number } | undefined;
+      const markdownWarnings: string[] = [];
+      if (contentIsMarkdown && parsed.content) {
+        const parsedMarkdown = parseMarkdownToOperations(parsed.content);
+        const applied = await applyMarkdownOperationsInternal({
+          workspaceId: created.workspaceId,
+          docId: created.docId,
+          operations: parsedMarkdown.operations,
+        });
+        markdownStats = {
+          parsedBlocks: parsedMarkdown.operations.length,
+          appliedBlocks: applied.appendedCount,
+          skippedBlocks: applied.skippedCount,
+        };
+        markdownWarnings.push(...parsedMarkdown.warnings);
+        if (applied.skippedCount > 0) {
+          markdownWarnings.push(`${applied.skippedCount} markdown block(s) could not be applied to AFFiNE and were skipped.`);
+        }
+      }
       const warnings = mergeWarnings(
         created.warnings ?? [],
         placement.warnings,
         folderPlacement.warnings,
-        createDocContentWarnings(parsed.content),
+        contentIsMarkdown ? markdownWarnings : createDocContentWarnings(parsed.content),
       );
       return receipt("doc.create", {
         workspaceId: created.workspaceId,
@@ -6661,7 +6689,15 @@ export function registerDocTools(
         folderId: folderPlacement.folderId,
         folderLinked: folderPlacement.folderLinked,
         folderNodeId: folderPlacement.folderNodeId,
-        warnings,
+        contentParsedAsMarkdown: contentIsMarkdown,
+        ...(markdownStats ? { stats: markdownStats } : {}),
+        warnings: contentIsMarkdown
+          ? [
+              ...warnings,
+              // Informational, so added after status/requiresManualRepair are decided.
+              "content contained markdown structure and was parsed into blocks. Call create_doc_from_markdown directly to control this (e.g. autoUploadImages), or pass single-line text to store it verbatim.",
+            ]
+          : warnings,
       });
     } catch (error) {
       const failure = documentCreationToolResult(error, "doc.create");
