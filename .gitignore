@@ -65,3 +65,6 @@ tests/test-theme-defaults-state.json
 
 # Package artifacts
 *.tgz
+
+# runtime auth-state cache written by the bearer test suite (contains a token) - never commit
+tests/test-bearer-state.json
